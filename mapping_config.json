@@ -1,0 +1,37 @@
+{
+  "files": {
+    "alpha_price.xlsx": {
+      "supplier": "ООО «Альфа-Трейд»",
+      "sheet": "Прайс",
+      "skip_rows": 0,
+      "columns": {
+        "name": "Наименование",
+        "sku": "Артикул",
+        "price": "Цена",
+        "qty": "Остаток"
+      }
+    },
+    "beta_price.xlsx": {
+      "supplier": "ООО «Бета-Снаб»",
+      "sheet": "Лист1",
+      "skip_rows": 2,
+      "columns": {
+        "name": "Товар",
+        "sku": "Код товара",
+        "price": "Цена, руб.",
+        "qty": "Остаток, шт"
+      }
+    },
+    "gamma_price.xlsx": {
+      "supplier": "Gamma Supply Ltd",
+      "sheet": "Price list",
+      "skip_rows": 0,
+      "columns": {
+        "name": "Name",
+        "sku": "SKU",
+        "price": "Price",
+        "qty": "Qty"
+      }
+    }
+  }
+}
