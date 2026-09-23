@@ -13,6 +13,7 @@
 """
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -132,15 +133,35 @@ def load_config(path):
 
 
 def get_mapping_for_file(mappings, path):
-    """Находит в конфиге блок маппинга для конкретного файла (по имени файла)."""
+    """Находит в конфиге блок маппинга для конкретного файла.
+
+    Сначала ищется точное совпадение имени файла, потом — ключи-шаблоны
+    вида "beta_price*.xlsx" (без учёта регистра): поставщики часто
+    присылают файлы с датой в имени.
+    """
     file_name = os.path.basename(path)
-    if file_name not in mappings:
+    if file_name in mappings:
+        return mappings[file_name]
+
+    matches = [
+        pattern
+        for pattern in mappings
+        if fnmatch.fnmatchcase(file_name.lower(), pattern.lower())
+    ]
+    if len(matches) > 1:
+        sys.exit(
+            f"Ошибка: файл '{file_name}' подходит сразу под несколько шаблонов "
+            f"в конфиге: {', '.join(sorted(matches))}.\n"
+            "       Уточните шаблоны, чтобы файлу соответствовал только один."
+        )
+    if not matches:
         sys.exit(
             f"Ошибка: в конфиге нет маппинга для файла '{file_name}'.\n"
-            f"       Добавьте блок \"{file_name}\" в раздел \"files\" конфига.\n"
+            f"       Добавьте блок \"{file_name}\" в раздел \"files\" конфига\n"
+            "       или ключ-шаблон вида \"поставщик_*.xlsx\" для файлов с датой в имени.\n"
             f"       Сейчас в конфиге описаны: {', '.join(sorted(mappings))}"
         )
-    return mappings[file_name]
+    return mappings[matches[0]]
 
 
 # =====================================================================
@@ -177,7 +198,11 @@ def collect_source_files(args):
 # =====================================================================
 
 def read_source_file(path, block):
-    """Читает один Excel-файл целиком как текст.
+    """Читает один Excel-файл как есть.
+
+    dtype=object: текстовые ячейки остаются строками, а числовые — числами,
+    поэтому ячейка со значением 3.125 не попадает под правило неоднозначности
+    "1.200" в parse_number.
 
     Из блока конфига берутся необязательные параметры:
         "sheet"      — имя листа (по умолчанию первый лист);
@@ -187,7 +212,7 @@ def read_source_file(path, block):
     skip_rows = block.get("skip_rows", 0)
 
     try:
-        return pd.read_excel(path, sheet_name=sheet, skiprows=skip_rows, dtype=str)
+        return pd.read_excel(path, sheet_name=sheet, skiprows=skip_rows, dtype=object)
     except Exception as e:
         # Ловим любую ошибку чтения и показываем понятный текст вместо трейсбека.
         # Самые частые причины — нет листа с таким именем или файл повреждён.
@@ -208,10 +233,14 @@ def apply_mapping(df, block, path):
     columns = block["columns"]
     file_name = os.path.basename(path)
 
+    # В заголовках бывают переносы строк ("Цена,\nруб."), двойные
+    # и неразрывные пробелы — приводим их к виду, в котором пишут конфиг
+    df = df.rename(columns=normalize_text)
+
     missing = [
         source_column
         for source_column in columns.values()
-        if source_column not in df.columns
+        if normalize_text(source_column) not in df.columns
     ]
     if missing:
         sys.exit(
@@ -222,7 +251,7 @@ def apply_mapping(df, block, path):
 
     result = pd.DataFrame()
     for field, target_column in TARGET_FIELDS.items():
-        result[target_column] = df[columns[field]]
+        result[target_column] = df[normalize_text(columns[field])]
 
     result[SUPPLIER_COLUMN] = block.get("supplier", file_name)
     result[SOURCE_COLUMN] = file_name
@@ -251,34 +280,91 @@ def normalize_sku(value):
     return normalize_text(value).upper()
 
 
+# Число внутри строки: начинается и заканчивается цифрой, внутри — цифры,
+# пробелы, точки и запятые. Так точка из "руб." или "шт." в число не попадает.
+NUMBER_PATTERN = re.compile(r"-?\d(?:[\d .,]*\d)?")
+
+
 def parse_number(value):
     """Превращает цену/количество в число.
 
-    Понимает: 1200, "1200.00", "1 200,00 ₽", "15 шт", "1,200.00".
-    Если распознать не удалось — возвращает None.
+    Понимает: 1200, "1200.00", "1 200,00 ₽", "1 340,00 руб.", "1.340,00",
+    "1,200.00", "1.200.000", "15 шт".
+    Возвращает None, если распознать не удалось или запись неоднозначна:
+    "1,200" может быть и 1200, и 1.2 — такое не угадываем, а отдаём в отчёт.
     """
-    if pd.isna(value):
+    if value is None or pd.isna(value):
         return None
     if isinstance(value, (int, float)):
         return float(value)
 
     text = str(value).replace("\xa0", " ")
-    # Оставляем только цифры, разделители и минус: убираем ₽, руб., шт, пробелы
-    text = re.sub(r"[^0-9,.\-]", "", text)
-    if not text:
+    numbers = NUMBER_PATTERN.findall(text)
+    # Ни одного числа ("под заказ") или несколько ("10-20 шт", "1.2e3") —
+    # какое из них имелось в виду, неизвестно
+    if len(numbers) != 1:
+        return None
+    return parse_number_token(numbers[0])
+
+
+def parse_number_token(token):
+    """Разбирает одно число вида "1 200 000,50" с учётом разделителей."""
+    sign = -1 if token.startswith("-") else 1
+    token = token.lstrip("-")
+
+    decimal = find_decimal_separator(token)
+    if decimal == "?":
         return None
 
-    if "," in text and "." in text:
-        # Формат "1,200.00" — запятая разделяет тысячи
-        text = text.replace(",", "")
+    if decimal:
+        integer_part, fraction = token.rsplit(decimal, 1)
     else:
-        # Формат "1200,50" — запятая десятичная
-        text = text.replace(",", ".")
-
-    try:
-        return float(text)
-    except ValueError:
+        integer_part, fraction = token, ""
+    if fraction and not fraction.isdigit():
+        # "340,00 5" — после десятичного разделителя только цифры
         return None
+
+    # Всё, что осталось в целой части, кроме цифр, — разделители тысяч:
+    # пробелы и тот знак, который не десятичный. Группы должны быть по 3 цифры,
+    # иначе это не разделители, а мусор ("1.2.3")
+    groups = re.split(r"[ .,]+", integer_part)
+    if len(groups) > 1 and (
+        not 1 <= len(groups[0]) <= 3
+        or any(len(group) != 3 for group in groups[1:])
+    ):
+        return None
+
+    return sign * float("".join(groups) + "." + (fraction or "0"))
+
+
+def find_decimal_separator(token):
+    """Определяет десятичный разделитель в числе.
+
+    Возвращает "." или ",", пустую строку, если дробной части нет,
+    и "?", если запись неоднозначна или некорректна.
+    """
+    has_dot = "." in token
+    has_comma = "," in token
+
+    if has_dot and has_comma:
+        # "1,200.00" и "1.200,00": десятичный — тот, что стоит последним
+        decimal = "." if token.rfind(".") > token.rfind(",") else ","
+        return decimal if token.count(decimal) == 1 else "?"
+
+    if not has_dot and not has_comma:
+        return ""
+
+    separator = "." if has_dot else ","
+    if token.count(separator) > 1:
+        # "1.200.000" — один и тот же знак несколько раз: разделитель тысяч
+        return ""
+
+    integer_part, fraction = token.split(separator)
+    if len(fraction) == 3 and integer_part.strip() != "0":
+        # "1,200" или "1.200": то ли тысячи, то ли дробь — не угадываем.
+        # Целая часть "0" ("0,125") разделителем тысяч быть не может
+        return "?"
+    return separator
 
 
 def normalize_frame(df):
@@ -293,8 +379,11 @@ def normalize_frame(df):
     prices = df[TARGET_FIELDS["price"]].apply(parse_number)
     quantities = df[TARGET_FIELDS["qty"]].apply(parse_number)
 
-    bad_prices = int((prices.isna() & df[TARGET_FIELDS["price"]].notna()).sum())
-    bad_quantities = int((quantities.isna() & df[TARGET_FIELDS["qty"]].notna()).sum())
+    # Нераспознанной считаем только непустую ячейку: пробелы — это пустое значение
+    has_price = df[TARGET_FIELDS["price"]].apply(normalize_text) != ""
+    has_quantity = df[TARGET_FIELDS["qty"]].apply(normalize_text) != ""
+    bad_prices = int((prices.isna() & has_price).sum())
+    bad_quantities = int((quantities.isna() & has_quantity).sum())
 
     df[TARGET_FIELDS["price"]] = prices.round(2)
     df[TARGET_FIELDS["qty"]] = quantities
